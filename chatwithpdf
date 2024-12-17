@@ -1,0 +1,96 @@
+import pdfplumber
+from sentence_transformers import SentenceTransformer
+import pinecone
+from langchain.prompts import PromptTemplate
+from langchain.chains import RetrievalQA
+from tabulate import tabulate
+
+# Initialize Pinecone for Vector Database
+pinecone.init(api_key="YOUR_PINECONE_API_KEY", environment="YOUR_PINECONE_ENV")
+index_name = "pdf-rag"
+if index_name not in pinecone.list_indexes():
+    pinecone.create_index(index_name, dimension=768)
+index = pinecone.Index(index_name)
+
+# Initialize Embedding Model
+embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+
+# PDF Data Extraction Function
+def extract_pdf_text(file_path):
+    extracted_text = []
+    with pdfplumber.open(file_path) as pdf:
+        for page_num, page in enumerate(pdf.pages, start=1):
+            text = page.extract_text()
+            extracted_text.append({"page": page_num, "text": text})
+    return extracted_text
+
+# Chunking Function (for better granularity)
+def chunk_text(text, chunk_size=200):
+    words = text.split()
+    chunks = [" ".join(words[i:i + chunk_size]) for i in range(0, len(words), chunk_size)]
+    return chunks
+
+# Ingest PDF Data into Pinecone
+def ingest_pdf_to_pinecone(file_path):
+    data = extract_pdf_text(file_path)
+    for page_data in data:
+        page = page_data['page']
+        text = page_data['text']
+        if text:
+            chunks = chunk_text(text)
+            for chunk in chunks:
+                embedding = embedding_model.encode(chunk).tolist()
+                index.upsert([(f"{file_path}page{page}{chunks.index(chunk)}", embedding, {"text": chunk, "page": page})])
+
+# Query Handling
+def query_pdf(query):
+    query_embedding = embedding_model.encode(query).tolist()
+    search_results = index.query(query_embedding, top_k=5, include_metadata=True)
+    retrieved_chunks = [result['metadata']['text'] for result in search_results['matches']]
+    return retrieved_chunks
+
+# Response Generation
+def generate_response(query, retrieved_chunks):
+    prompt_template = """
+    You are an assistant that answers questions accurately using the provided context.
+    Context:
+    {context}
+
+    Question:
+    {query}
+
+    Answer the question based on the context:
+    """
+    context = "\n".join(retrieved_chunks)
+    prompt = PromptTemplate(template=prompt_template, input_variables=["context", "query"])
+    response = prompt.format(context=context, query=query)
+    return response
+
+# Comparison Queries
+def handle_comparison_query(query, retrieved_chunks):
+    # Process data for comparison (example: parsing for tabular comparisons)
+    response = generate_response(query, retrieved_chunks)
+    return response
+
+# Run the RAG pipeline
+def main():
+    # Step 1: Ingest PDF into Pinecone
+    pdf_file_path = "example.pdf"  # Replace with your file path
+    ingest_pdf_to_pinecone(pdf_file_path)
+
+    # Step 2: User Query
+    user_query = "What is the unemployment rate for Bachelor's degree holders?"  # Example query
+    retrieved_chunks = query_pdf(user_query)
+
+    # Step 3: Generate Response
+    response = generate_response(user_query, retrieved_chunks)
+    print("Response:\n", response)
+
+    # Step 4: Handle Comparison Query (if required)
+    comparison_query = "Compare employment rates from the table."  # Example comparison query
+    comparison_response = handle_comparison_query(comparison_query, retrieved_chunks)
+    print("\nComparison Response:\n", comparison_response)
+
+# Execute the script
+if _name_ == "_main_":
+    main()
